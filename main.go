@@ -35,14 +35,24 @@ type config struct {
 	maxFileSizeKB   int
 	outputDir       string
 	skipHiddenFiles bool
+	// NEW: Maps for storing items to skip for efficient lookups
+	skipExts map[string]struct{}
+	skipDirs map[string]struct{}
 }
 
 func main() {
 	cfg := &config{}
+
+	// NEW: String vars to capture comma-separated flag values
+	var skipExtsStr, skipDirsStr string
+
 	flag.StringVar(&cfg.rootPath, "root", ".", "Root directory to process")
 	flag.IntVar(&cfg.maxFileSizeKB, "max-size", 1024, "Maximum output file size in KB")
 	flag.StringVar(&cfg.outputDir, "output", "output", "Output directory for generated files")
 	flag.BoolVar(&cfg.skipHiddenFiles, "skip-hidden", true, "Skip hidden files and directories (default: true)")
+	// NEW: Define new command-line flags for skipping extensions and directories
+	flag.StringVar(&skipExtsStr, "skip-ext", "", "Comma-separated list of file extensions to skip (e.g., .log,.tmp)")
+	flag.StringVar(&skipDirsStr, "skip-dir", "", "Comma-separated list of directory names to skip (e.g., node_modules,.git)")
 	flag.Parse()
 
 	if _, err := os.Stat(cfg.rootPath); os.IsNotExist(err) {
@@ -51,6 +61,25 @@ func main() {
 
 	if cfg.maxFileSizeKB <= 0 {
 		log.Fatal("Max file size must be positive")
+	}
+
+	// NEW: Process the string flags into maps for efficient lookup
+	cfg.skipExts = make(map[string]struct{})
+	if skipExtsStr != "" {
+		for _, ext := range strings.Split(skipExtsStr, ",") {
+			trimmedExt := strings.TrimSpace(ext)
+			if !strings.HasPrefix(trimmedExt, ".") {
+				trimmedExt = "." + trimmedExt
+			}
+			cfg.skipExts[trimmedExt] = struct{}{}
+		}
+	}
+
+	cfg.skipDirs = make(map[string]struct{})
+	if skipDirsStr != "" {
+		for _, dir := range strings.Split(skipDirsStr, ",") {
+			cfg.skipDirs[strings.TrimSpace(dir)] = struct{}{}
+		}
 	}
 
 	if err := os.MkdirAll(cfg.outputDir, 0755); err != nil {
@@ -82,7 +111,7 @@ func main() {
 	if _, err := state.currentFile.WriteString("DIRECTORY STRUCTURE:\n" + directoryTree + "\n\n"); err != nil {
 		log.Fatalf("Failed to write directory structure: %v", err)
 	}
-	state.currentSize = int64(len(directoryTree)) + 2 // Add 2 for newlines
+	state.currentSize = int64(len(directoryTree)) + 2
 
 	processFiles(filePaths, cfg, state)
 
@@ -102,12 +131,27 @@ func generateDirectoryTree(cfg *config) (string, error) {
 			return err
 		}
 
-		// Skip hidden files and directories if configured to do so
+		// MODIFIED: Enhanced skip logic
+		baseName := info.Name()
+
+		// Skip hidden files and directories if configured
 		if cfg.skipHiddenFiles && isHiddenFile(path) {
 			if info.IsDir() {
 				return filepath.SkipDir // Skip the entire directory
 			}
 			return nil // Skip the file
+		}
+
+		if info.IsDir() {
+			// Skip specified directory names
+			if _, found := cfg.skipDirs[baseName]; found {
+				return filepath.SkipDir
+			}
+		} else {
+			// Skip specified file extensions
+			if _, found := cfg.skipExts[filepath.Ext(baseName)]; found {
+				return nil
+			}
 		}
 
 		// Calculate relative path and depth
@@ -150,7 +194,10 @@ func collectFilePaths(cfg *config) ([]string, error) {
 			return err
 		}
 
-		// Skip hidden files and directories if configured to do so
+		// MODIFIED: Enhanced skip logic
+		baseName := info.Name()
+
+		// Skip hidden files and directories if configured
 		if cfg.skipHiddenFiles && isHiddenFile(path) {
 			if info.IsDir() {
 				return filepath.SkipDir // Skip the entire directory
@@ -158,11 +205,20 @@ func collectFilePaths(cfg *config) ([]string, error) {
 			return nil // Skip the file
 		}
 
-		// Skip directories
+		// If it's a directory, check if it should be skipped
 		if info.IsDir() {
-			return nil
+			if _, found := cfg.skipDirs[baseName]; found {
+				return filepath.SkipDir
+			}
+			return nil // Continue traversal but don't add directory path to the list
 		}
 
+		// If it's a file, check its extension
+		if _, found := cfg.skipExts[filepath.Ext(baseName)]; found {
+			return nil // Skip this file
+		}
+
+		// If all checks pass, add the file path
 		filePaths = append(filePaths, path)
 		return nil
 	})
@@ -206,7 +262,8 @@ func worker(fileChan <-chan string, wg *sync.WaitGroup, cfg *config, state *outp
 
 // processFile reads a file and writes its content to the output
 func processFile(filePath string, cfg *config, state *outputState) {
-	// Skip hidden files if configured to do so (double-check)
+	// Note: An explicit check here is redundant because collectFilePaths
+	// already filters the list, but it's kept for robustness.
 	if cfg.skipHiddenFiles && isHiddenFile(filePath) {
 		return
 	}
